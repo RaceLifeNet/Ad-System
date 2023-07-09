@@ -2,13 +2,14 @@ import os
 import time
 import random
 import json
-import subprocess
 import threading
-from flask import Flask, request, jsonify, send_from_directory, render_template
+from flask import Flask, request, jsonify, send_from_directory, render_template, abort, send_file
 from werkzeug.utils import secure_filename
 import string
+import requests
+import datetime
+import re
 
-subprocess.run(['npx', 'tailwindcss', 'build', 'styles.css', '-o', 'static/css/styles.min.css'])
 app = Flask(__name__)
 
 # Password to access the web panel
@@ -18,7 +19,7 @@ PASSWORD = "password"
 JSON_FILE = "ads.json"
 
 # Directory to store ad images
-AD_IMAGES_DIR = "ad_images"
+AD_IMAGES_DIR = "api/ad_images"
 
 # Load ads from JSON file
 def load_ads():
@@ -32,6 +33,8 @@ def load_ads():
 def save_ads(ads):
     with open(JSON_FILE, "w") as file:
         json.dump(ads, file, indent=4)
+    log_message = f"Ads modified at {datetime.datetime.now()}"
+    send_discord_log(log_message)
 
 # Check if the image has dimensions 1920x1080
 def is_image_valid(file_path):
@@ -49,7 +52,7 @@ def generate_random_filename():
 
 # Generate a public URL for the uploaded image
 def get_public_url(filename):
-    return f"https://race-life-ad-system.frontlinegen.repl.co/{AD_IMAGES_DIR}/{filename}"
+    return f"https://ads.race-life.net/{AD_IMAGES_DIR}/{filename}"
 
 # Recheck the JSON file every 5 seconds
 def recheck_json():
@@ -79,10 +82,13 @@ def remove_ad(ad_id):
             if os.path.exists(ad_image_path):
                 os.remove(ad_image_path)
 
+            log_message = f"Ad removed: ID={ad_id}, Link={ad['ad_link']}, Image={ad['ad_image']}, Timestamp={datetime.datetime.now()}"
+            send_discord_log(log_message)
+
             break
 
 # Endpoint to serve a random ad in JSON
-@app.route('/serve_ad', methods=['GET'])
+@app.route('/api/serve_ad', methods=['GET'])
 def serve_ad():
     if len(ads) > 0:
         ad = random.choice(ads)
@@ -90,9 +96,27 @@ def serve_ad():
     else:
         return jsonify({'error': 'No ads available.'})
 
-@app.route('/ad_images/<path:filename>')
+@app.route('/api/ad_images/<path:filename>')
 def serve_ad_image(filename):
-    return send_from_directory(AD_IMAGES_DIR, filename)
+    file_path = os.path.join(AD_IMAGES_DIR, filename)
+    
+    # Check if the file exists
+    if not os.path.isfile(file_path):
+        abort(404)  # Return a 404 error if the file doesn't exist
+    
+    # Determine the file extension
+    file_extension = os.path.splitext(filename)[1].lower()
+    
+    # Serve image files
+    if file_extension in ['.png', '.jpg', '.jpeg', '.gif']:
+        return send_from_directory(AD_IMAGES_DIR, filename)
+    
+    # Serve video files
+    if file_extension in ['.mp4', '.obv']:
+        return send_from_directory(AD_IMAGES_DIR, filename, mimetype='video/mp4')
+    
+    # Return a 404 error for unsupported file types
+    abort(404)
 
 # Endpoint for adding an ad campaign
 @app.route('/admin/add_ad', methods=['POST'])
@@ -122,6 +146,10 @@ def add_ad():
             }
             ads.append(ad)
             save_ads(ads)
+
+            log_message = f"Ad added: ID={ad['id']}, Link={ad_link}, Image={ad['ad_image']}, Timestamp={datetime.datetime.now()}"
+            send_discord_log(log_message)
+
             return "Ad added successfully!"
         else:
             os.remove(image_path)  # Remove the invalid image
@@ -142,6 +170,11 @@ def remove_ad_endpoint():
 
 # Web panel HTML
 WEB_PANEL_HTML = '''
+<html>
+<head>
+    <meta name="viewport" content="width=device-width">
+    </head>
+    <body>
     <form method="post" enctype="multipart/form-data" action="/admin/add_ad">
         <h2>Add Ad</h2>
         <label for="password">Password:</label>
@@ -166,6 +199,8 @@ WEB_PANEL_HTML = '''
         <br><br>
         <input type="submit" value="Remove Ad">
     </form>
+    </body>
+    </html>
 '''
 
 # Endpoint for the web panel
@@ -173,10 +208,58 @@ WEB_PANEL_HTML = '''
 def web_panel():
     return WEB_PANEL_HTML
 
+@app.route('/favicon.ico')
+def favicon():
+    return send_from_directory('api/favicons', 'favicon.ico')
+
+@app.route('/robot.txt')
+def serve_robot_txt():
+    return send_file('api/robot.txt')
+
+@app.route('/sitemap.xml')
+def serve_sitemap():
+    return send_file('api/sitemap.xml')
+  
 @app.route('/')
 def index():
-    return render_template('index.html')
-  
+    template = render_template('index.html')
+    cleaned_template = remove_whitespace_between_tags(template)
+    return cleaned_template
+
+# Function to remove whitespace between HTML tags
+def remove_whitespace_between_tags(html):
+    pattern = r">\s+<"
+    cleaned_html = re.sub(pattern, '><', html)
+    return cleaned_html
+
+# Function to send a log message to Discord
+def send_discord_log(content):
+    webhook_url = os.environ['DISCORD_WEBHOOK']
+    headers = {'Content-Type': 'application/json'}
+
+    if isinstance(content, dict):
+        # Embed with ad image
+        embed = {
+            'title': 'Ad System Log',
+            'color': 16711680,  # Red
+            'image': {
+                'url': content['ad_image']
+            }
+        }
+    else:
+        # Regular log message
+        embed = {
+            'title': 'Ad System Log',
+            'description': content,
+            'color': 16711680  # Red
+        }
+
+    payload = {'embeds': [embed]}
+    response = requests.post(webhook_url, headers=headers, json=payload)
+
+    if response.status_code != 204:
+        print('Failed to send Discord log:', response.text)
+
 if __name__ == '__main__':
     if not os.path.exists(AD_IMAGES_DIR):
         os.makedirs(AD_IMAGES_DIR)
